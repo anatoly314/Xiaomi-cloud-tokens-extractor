@@ -11,6 +11,10 @@ from sys import platform
 import requests
 from Crypto.Cipher import ARC4
 
+# Add these imports for captcha handling
+from PIL import Image
+import io
+
 if platform != "win32":
     import readline
 
@@ -47,7 +51,7 @@ class XiaomiCloudConnector:
             self._sign = self.to_json(response.text)["_sign"]
         return valid
 
-    def login_step_2(self):
+    def login_step_2(self, captcha_code=None, captcha_ick=None):
         url = "https://account.xiaomi.com/pass/serviceLoginAuth2"
         headers = {
             "User-Agent": self._agent,
@@ -62,10 +66,28 @@ class XiaomiCloudConnector:
             "_sign": self._sign,
             "_json": "true"
         }
+
+        # Add captcha code if provided
+        if captcha_code:
+            fields["captCode"] = captcha_code
+            if captcha_ick:
+                fields["ick"] = captcha_ick
+
         response = self._session.post(url, headers=headers, params=fields)
         valid = response is not None and response.status_code == 200
         if valid:
             json_resp = self.to_json(response.text)
+
+            # Debug: print response when captcha is provided
+            if captcha_code:
+                print(f"Debug - Response after captcha: {json_resp}")
+
+            # Check for captcha requirement
+            if "captchaUrl" in json_resp and json_resp.get("captchaUrl") is not None:
+                print("\nCaptcha required. Downloading captcha image...")
+                ick = json_resp.get("ick", None)
+                return self.handle_captcha(json_resp["captchaUrl"], ick)
+
             valid = "ssecurity" in json_resp and len(str(json_resp["ssecurity"])) > 4
             if valid:
                 self._ssecurity = json_resp["ssecurity"]
@@ -79,7 +101,62 @@ class XiaomiCloudConnector:
                     print("Two factor authentication required, please use following url and restart extractor:")
                     print(json_resp["notificationUrl"])
                     print()
+                elif "description" in json_resp:
+                    print(f"Login error: {json_resp['description']}")
+                else:
+                    print(f"Login failed. Response: {json_resp}")
         return valid
+
+    def handle_captcha(self, captcha_url, ick=None):
+        """Download and display captcha, then retry login with user input"""
+        try:
+            # Check if captcha_url is None
+            if captcha_url is None:
+                print("Error: Captcha URL is empty")
+                return False
+
+            # Fix relative URLs
+            if captcha_url.startswith('/'):
+                captcha_url = 'https://account.xiaomi.com' + captcha_url
+
+            print(f"Debug - Captcha URL: {captcha_url}")
+            if ick:
+                print(f"Debug - ICK: {ick}")
+
+            # Download captcha image
+            response = self._session.get(captcha_url)
+            if response.status_code == 200:
+                # Open and display the image
+                img = Image.open(io.BytesIO(response.content))
+
+                # Save to temporary file and show
+                captcha_file = "captcha.png"
+                img.save(captcha_file)
+                print(f"Captcha image saved as '{captcha_file}'")
+
+                # Try to display the image
+                try:
+                    img.show()
+                    print("Captcha image should be displayed in your default image viewer.")
+                except:
+                    print(f"Could not automatically open captcha. Please manually open '{captcha_file}'")
+
+                # Get user input
+                captcha_code = input("\nPlease enter the captcha code shown in the image: ")
+
+                # Retry login with captcha - need to get fresh _sign first
+                print("Retrying login with captcha...")
+                if self.login_step_1():  # Get fresh _sign
+                    return self.login_step_2(captcha_code, ick)
+                else:
+                    print("Failed to refresh login token")
+                    return False
+            else:
+                print("Failed to download captcha image")
+                return False
+        except Exception as e:
+            print(f"Error handling captcha: {e}")
+            return False
 
     def login_step_3(self):
         headers = {
@@ -99,6 +176,9 @@ class XiaomiCloudConnector:
         if self.login_step_1():
             if self.login_step_2():
                 if self.login_step_3():
+                    # Clean up captcha file if it exists
+                    if os.path.exists("captcha.png"):
+                        os.remove("captcha.png")
                     return True
                 else:
                     print("Unable to get service token.")
@@ -118,8 +198,8 @@ class XiaomiCloudConnector:
         url = self.get_api_url(country) + "/v2/home/home_device_list"
         params = {
             "data": '{"home_owner": ' + str(owner_id) +
-            ',"home_id": ' + str(home_id) +
-            ',  "limit": 200,  "get_split_device": true, "support_smart_home": true}'
+                    ',"home_id": ' + str(home_id) +
+                    ',  "limit": 200,  "get_split_device": true, "support_smart_home": true}'
         }
         return self.execute_api_call_encrypted(url, params)
 
